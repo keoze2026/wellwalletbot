@@ -30,6 +30,18 @@ function parseIds(raw: string): Set<number> {
   );
 }
 
+/**
+ * Wallet ownership type sent to POST /wallets. Determines where deposits land:
+ *   - "user"       — private, per-user wallet
+ *   - "accounting" — exchange / aggregation wallet
+ */
+function walletTypeFrom(raw: string): "user" | "accounting" {
+  if (raw !== "user" && raw !== "accounting") {
+    throw new Error(`WALLET_TYPE must be "user" or "accounting", got "${raw}"`);
+  }
+  return raw;
+}
+
 const config = {
   botToken: required("BOT_TOKEN"),
   logLevel: optional("LOG_LEVEL", "info"),
@@ -37,6 +49,7 @@ const config = {
   walletApi: {
     baseUrl: required("WALLET_API_BASE_URL"),
     token: required("WALLET_API_TOKEN"),
+    walletType: walletTypeFrom(optional("WALLET_TYPE", "accounting")),
   },
 } as const;
 
@@ -103,7 +116,7 @@ async function createTrc20Wallet(name: string): Promise<WalletData> {
         "Content-Type": "application/json",
         token: config.walletApi.token,
       },
-      body: JSON.stringify({ name, network: "trx", type: "user" }),
+      body: JSON.stringify({ name, network: "trx", type: config.walletApi.walletType }),
     });
   } catch (err) {
     logger.error("Wallet API request failed (network error):", err);
