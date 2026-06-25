@@ -1,5 +1,7 @@
 import "dotenv/config";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Bot, InputFile, type Context } from "grammy";
+import nodemailer from "nodemailer";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -42,6 +44,42 @@ function walletTypeFrom(raw: string): "user" | "accounting" {
   return raw;
 }
 
+/**
+ * Which transaction directions trigger an email alert:
+ *   "in" = deposit, "out" = withdrawal. Defaults to both.
+ */
+function parseDirections(raw: string): Set<"in" | "out"> {
+  const set = new Set<"in" | "out">();
+  for (const part of raw.split(",").map((s) => s.trim().toLowerCase())) {
+    if (part === "in" || part === "out") set.add(part);
+  }
+  if (set.size === 0) {
+    set.add("in");
+    set.add("out");
+  }
+  return set;
+}
+
+/**
+ * Email/SMTP settings for transaction notifications. Returns null (email
+ * disabled) unless at least SMTP_HOST and MAIL_TO are provided.
+ */
+function mailConfigFrom() {
+  const host = optional("SMTP_HOST", "");
+  const to = optional("MAIL_TO", "");
+  if (!host || !to) return null;
+  const user = optional("SMTP_USER", "");
+  return {
+    host,
+    port: Number(optional("SMTP_PORT", "587")),
+    secure: optional("SMTP_SECURE", "false") === "true",
+    user,
+    pass: optional("SMTP_PASS", ""),
+    from: optional("MAIL_FROM", user),
+    to,
+  };
+}
+
 const config = {
   botToken: required("BOT_TOKEN"),
   logLevel: optional("LOG_LEVEL", "info"),
@@ -51,6 +89,14 @@ const config = {
     token: required("WALLET_API_TOKEN"),
     walletType: walletTypeFrom(optional("WALLET_TYPE", "accounting")),
   },
+  webhook: {
+    port: Number(optional("WEBHOOK_PORT", "8080")),
+    // The provider POSTs transaction callbacks here. Put a hard-to-guess secret
+    // in the path (e.g. /webhook/9f3a…) — exact-path match is the auth.
+    path: optional("WEBHOOK_PATH", "/webhook"),
+  },
+  notifyDirections: parseDirections(optional("NOTIFY_DIRECTIONS", "in,out")),
+  mail: mailConfigFrom(),
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -309,6 +355,152 @@ async function messageHandler(ctx: Context): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Deposit & withdrawal notifications: webhook receiver -> email
+// ---------------------------------------------------------------------------
+
+/** Transaction payload the wallet API posts to our webhook (data field). */
+interface WebhookTx {
+  amount?: string;
+  currency?: string;
+  recipient_wallet?: string;
+  sender_wallet?: string;
+  direction?: "in" | "out";
+  status?: string;
+  fee?: string;
+  hash?: string;
+  created?: string;
+  user_id?: string;
+  external_id?: string;
+}
+
+let mailer: ReturnType<typeof nodemailer.createTransport> | null = null;
+
+function getMailer() {
+  const mail = config.mail;
+  if (!mail) return null;
+  if (!mailer) {
+    mailer = nodemailer.createTransport({
+      host: mail.host,
+      port: mail.port,
+      secure: mail.secure,
+      auth: mail.user ? { user: mail.user, pass: mail.pass } : undefined,
+    });
+  }
+  return mailer;
+}
+
+/**
+ * Emails a transaction alert. Handles both directions:
+ *   - "in"  = deposit received on one of our wallets
+ *   - "out" = withdrawal sent from one of our wallets
+ */
+async function sendTransactionEmail(tx: WebhookTx): Promise<void> {
+  const mail = config.mail;
+  const transport = getMailer();
+  if (!mail || !transport) {
+    logger.warn("Transaction event received but email is not configured (set SMTP_HOST + MAIL_TO).");
+    return;
+  }
+
+  const isDeposit = tx.direction === "in";
+  const amount = `${tx.amount ?? "?"} ${tx.currency ?? ""}`.trim();
+  const title = isDeposit ? "💰 Deposit received" : "📤 Withdrawal sent";
+  const lead = isDeposit
+    ? "A deposit was received on a generated wallet."
+    : "A withdrawal was sent from a wallet.";
+  // For a deposit our wallet is the recipient; for a withdrawal it is the sender.
+  const ourWallet = isDeposit ? tx.recipient_wallet : tx.sender_wallet;
+  const counterparty = isDeposit ? tx.sender_wallet : tx.recipient_wallet;
+
+  const text = [
+    lead,
+    ``,
+    `Amount:       ${amount}`,
+    `Wallet:       ${ourWallet ?? "?"}`,
+    `${isDeposit ? "From" : "To"}:         ${counterparty ?? "?"}`,
+    tx.fee ? `Fee:          ${tx.fee}` : "",
+    `Status:       ${tx.status ?? "?"}`,
+    tx.hash ? `Tx hash:      ${tx.hash}` : "",
+    tx.created ? `Time:         ${tx.created}` : "",
+    tx.external_id ? `External ID:  ${tx.external_id}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await transport.sendMail({
+    from: mail.from || mail.user,
+    to: mail.to,
+    subject: `${title}: ${amount}`,
+    text,
+  });
+  logger.info(`${title} email sent to ${mail.to} (${amount})`);
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1_000_000) {
+        req.destroy();
+        reject(new Error("Webhook body too large"));
+      }
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+async function handleWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const pathOnly = (req.url ?? "").split("?")[0];
+  if (req.method !== "POST" || pathOnly !== config.webhook.path) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ result: "not_found" }));
+    return;
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ result: "bad_request" }));
+    return;
+  }
+
+  const tx = (payload as { data?: WebhookTx } | null)?.data;
+  // direction "in" = deposit, "out" = withdrawal — notify per NOTIFY_DIRECTIONS.
+  if (tx?.direction && config.notifyDirections.has(tx.direction)) {
+    logger.info(
+      `Tx webhook [${tx.direction}]: ${tx.amount} ${tx.currency} (${tx.status})`,
+    );
+    // Don't let a slow/failing SMTP block the webhook ack.
+    sendTransactionEmail(tx).catch((err) => logger.error("sendTransactionEmail failed:", err));
+  } else {
+    logger.debug(`Webhook ignored (direction=${tx?.direction ?? "none"})`);
+  }
+
+  // Always 2xx so the provider doesn't retry endlessly.
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ result: "success" }));
+}
+
+function startWebhookServer(): void {
+  const server = createServer((req, res) => {
+    handleWebhook(req, res).catch((err) => {
+      logger.error("Webhook handler error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ result: "error" }));
+      }
+    });
+  });
+  server.listen(config.webhook.port, () => {
+    logger.info(`Webhook listening on :${config.webhook.port}${config.webhook.path}`);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Bot setup & startup
 // ---------------------------------------------------------------------------
 
@@ -347,6 +539,18 @@ async function main(): Promise<void> {
     logger.info("SIGTERM received, shutting down...");
     void bot.stop();
   });
+
+  // Start the deposit-notification webhook receiver.
+  startWebhookServer();
+  const mail = config.mail;
+  if (mail) {
+    getMailer()
+      ?.verify()
+      .then(() => logger.info(`Email notifications enabled -> ${mail.to}`))
+      .catch((err) => logger.error("SMTP verify failed (emails may not send):", err));
+  } else {
+    logger.warn("Email notifications disabled (set SMTP_HOST and MAIL_TO to enable).");
+  }
 
   logger.info("Starting bot (long polling)...");
   await bot.start({
