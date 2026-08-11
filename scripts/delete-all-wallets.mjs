@@ -6,13 +6,14 @@
  * are all disregarded. Any USDT held on a deleted address becomes recoverable
  * only through WellWallet support.
  *
+ * Balance is never a condition of deletion — every wallet goes, funded or not.
+ * The census is a report printed beforehand, nothing more.
+ *
  * Usage (from the project root, on a host whose IP is allowlisted):
  *
- *   node scripts/delete-all-wallets.mjs            # census only, deletes nothing
- *   node scripts/delete-all-wallets.mjs --yes      # census, then deletes everything
- *
- * The census is always printed first so the balance about to be destroyed is
- * visible before anything is removed.
+ *   node scripts/delete-all-wallets.mjs                    # report only, deletes nothing
+ *   node scripts/delete-all-wallets.mjs --yes              # report, 10s pause, then deletes all
+ *   node scripts/delete-all-wallets.mjs --yes --no-census  # deletes all immediately, no report
  */
 import "dotenv/config";
 import { appendFileSync } from "node:fs";
@@ -20,6 +21,7 @@ import { appendFileSync } from "node:fs";
 const BASE_URL = process.env.WALLET_API_BASE_URL;
 const TOKEN = process.env.WALLET_API_TOKEN;
 const CONFIRMED = process.argv.includes("--yes");
+const SKIP_CENSUS = process.argv.includes("--no-census");
 
 const PAGE_SIZE = 200;
 const MAX_PAGES = 25;
@@ -110,37 +112,44 @@ function census(wallets) {
 
 async function main() {
 const wallets = await listAllWallets();
-const { totals, funded, unreadable, botCreated } = census(wallets);
-const tokenLines = Object.entries(totals).sort((a, b) => b[1] - a[1]);
 
-console.log("\n=================== WALLET CENSUS ===================");
-console.log(`Total wallets:            ${wallets.length}`);
-console.log(`Created by this bot:      ${botCreated}`);
-console.log(`Created elsewhere:        ${wallets.length - botCreated}`);
-console.log(`Holding a balance:        ${funded}`);
-console.log(`Balance unreadable:       ${unreadable}`);
-console.log("\nBALANCE THAT WILL BE DESTROYED:");
-if (tokenLines.length === 0) {
-  console.log("  (none detected — every readable balance is zero)");
-} else {
-  for (const [ticker, amount] of tokenLines) {
-    console.log(`  ${ticker.padEnd(8)} ${amount}`);
+// The census never gates deletion — balances are reported, never acted on.
+// --no-census suppresses the report and the pause for an unattended run.
+let holdsFunds = false;
+if (!SKIP_CENSUS) {
+  const { totals, funded, unreadable, botCreated } = census(wallets);
+  const tokenLines = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  holdsFunds = funded > 0 || tokenLines.length > 0;
+
+  console.log("\n=================== WALLET CENSUS ===================");
+  console.log(`Total wallets:            ${wallets.length}`);
+  console.log(`Created by this bot:      ${botCreated}`);
+  console.log(`Created elsewhere:        ${wallets.length - botCreated}`);
+  console.log(`Holding a balance:        ${funded}`);
+  console.log(`Balance unreadable:       ${unreadable}`);
+  console.log("\nBALANCE THAT WILL BE DESTROYED:");
+  if (tokenLines.length === 0) {
+    console.log("  (none detected — every readable balance is zero)");
+  } else {
+    for (const [ticker, amount] of tokenLines) {
+      console.log(`  ${ticker.padEnd(8)} ${amount}`);
+    }
   }
+  console.log("=====================================================\n");
 }
-console.log("=====================================================\n");
 
 if (!CONFIRMED) {
-  console.log("Census only — nothing deleted.");
-  console.log("Re-run with --yes to delete all wallets, including the balances listed above.");
+  console.log("Nothing deleted — this was a report only.");
+  console.log("Re-run with --yes to delete every wallet, balances included.");
   process.exit(0);
 }
 
-if (funded > 0 || tokenLines.length > 0) {
-  console.log(`⚠️  ${funded} wallets hold funds. Deleting in 10 seconds — Ctrl+C to abort.`);
+if (holdsFunds) {
+  console.log("⚠️  Wallets holding funds will be deleted. Starting in 10 seconds — Ctrl+C to abort.");
   await sleep(10_000);
 }
 
-console.log(`Deleting ${wallets.length} wallets...\n`);
+console.log(`Deleting all ${wallets.length} wallets, balance disregarded...\n`);
 let deleted = 0;
 let failed = 0;
 
