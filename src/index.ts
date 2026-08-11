@@ -184,13 +184,23 @@ interface WalletListData {
   wallets?: WalletListEntry[];
 }
 
-/** Documented response envelope: { code, error_code, error_message, data }. */
+/**
+ * Response envelope. The docs specify snake_case (error_message/error_code) but
+ * the live API answers in camelCase — accept both, or real error text is lost.
+ */
 interface ApiEnvelope<T> {
   code?: string;
   error_code?: string;
   error_message?: string;
+  errorCode?: string;
+  errorMessage?: string;
   data?: T;
 }
+
+const envelopeError = (e: ApiEnvelope<unknown>) => ({
+  message: e.errorMessage ?? e.error_message,
+  code: e.errorCode ?? e.error_code,
+});
 
 /**
  * One wallet-API call. Every endpoint shares the same envelope and `token`
@@ -240,12 +250,10 @@ async function walletApiRequest<T>(
     // A 404 here is usually the 500-wallet account cap rather than a missing
     // route. Log the raw payload when it isn't the documented envelope, or the
     // real reason stays invisible.
-    const envelope = parsed as ApiEnvelope<unknown>;
-    const detail = envelope.error_message ?? `(undocumented body: ${raw.slice(0, 300)})`;
-    logger.error(
-      `Wallet API ${method} ${url} -> ${res.status} ${envelope.error_code ?? ""}: ${detail}`,
-    );
-    throw new Error(envelope.error_message || `Wallet provider returned ${res.status}`);
+    const { message, code } = envelopeError(parsed as ApiEnvelope<unknown>);
+    const detail = message ?? `(undocumented body: ${raw.slice(0, 300)})`;
+    logger.error(`Wallet API ${method} ${url} -> ${res.status} ${code ?? ""}: ${detail}`);
+    throw new Error(message || `Wallet provider returned ${res.status}`);
   }
 
   return (parsed as ApiEnvelope<T> | undefined)?.data;
