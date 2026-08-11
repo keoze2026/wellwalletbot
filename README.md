@@ -51,32 +51,26 @@ old addresses automatically.
 
 A sweep runs at startup, every `WALLET_PRUNE_INTERVAL_HOURS`, and immediately
 after any `/topup` failure. When the account holds more than
-`WALLET_PRUNE_THRESHOLD` (350) wallets, it scans the oldest
-`WALLET_PRUNE_WINDOW` (200) and deletes **only those with a zero balance**.
+`WALLET_PRUNE_THRESHOLD` (350) wallets, it deletes the **oldest** wallets back
+down to that threshold, at most `WALLET_PRUNE_MAX_PER_RUN` (200) per sweep.
 
-Deletion is irreversible — [the docs](https://docs.wellwallet.io/api-reference/wallets/delete-wallet)
-warn that funds sent to a deleted address are inaccessible without provider
-support. Three guards make a wallet safe to delete, and all must hold:
+> ⚠️ **Balance and age are not checked.** A wallet still holding USDT is deleted
+> along with the rest, and [the docs](https://docs.wellwallet.io/api-reference/wallets/delete-wallet)
+> warn that funds sent to a deleted address are recoverable only by contacting
+> provider support. This is a deliberate choice — deposits landing on an old
+> address are expected to be swept before the address ages out.
 
-| Guard | Why |
-| --- | --- |
-| Explicit zero on every token | Never destroy an address holding funds. Missing or unreadable balance data counts as *unknown*, not empty — the wallet is skipped |
-| Balance re-read immediately before deleting | The listing can be a minute old by the time the queue drains; a deposit landing in that gap must not be deleted with the wallet |
-| Older than `WALLET_PRUNE_MIN_AGE_HOURS` (24h) | A user may still pay into an address `/topup` just issued |
-| Name matches `tg-<userId>-<epochMs>` | Only wallets this bot created; manual and aggregation wallets are untouchable |
-
-The API returns **no creation timestamp**, so wallet age comes from the `name`
-`/topup` assigns at creation. Wallets named any other way have no recoverable
-age and are therefore never pruned.
+The only wallets touched are those named `tg-<userId>-<epochMs>` by `/topup`.
+That is **not** a safety filter: the API returns no creation timestamp, so the
+name is the sole way to order wallets by age. A wallet named any other way —
+manually created, or an aggregation wallet — has no recoverable age and is
+therefore left alone.
 
 Set `WALLET_PRUNE_DRY_RUN=true` to log what a sweep *would* delete without
-deleting anything.
+deleting anything, or `WALLET_PRUNE_ENABLED=false` to stop sweeping entirely.
 
-**Residual risk this does not remove:** a user who was issued an address more
-than 24h ago, whose wallet is empty at sweep time, and who pays *after* the
-sweep deletes it. Their deposit lands on a deleted address and needs provider
-support to recover. Raising `WALLET_PRUNE_MIN_AGE_HOURS` narrows the window but
-cannot close it — only expiring addresses in the `/topup` message can.
+To wipe the account completely, `scripts/delete-all-wallets.mjs` deletes every
+wallet regardless of name, age or balance. See the header of that file.
 
 ## Scripts
 

@@ -63,7 +63,8 @@ function parseDirections(raw: string): Set<"in" | "out"> {
 /**
  * Wallet-pruning settings. The provider caps an account at 500 wallets, and
  * POST /wallets answers 404 once that cap is hit — so the oldest wallets are
- * recycled whenever the count passes `threshold`.
+ * recycled whenever the count passes `threshold`. Balances are not consulted;
+ * see pruneOldWallets().
  */
 function pruneConfigFrom() {
   const num = (name: string, fallback: number): number => {
@@ -78,13 +79,10 @@ function pruneConfigFrom() {
     // Log what would be deleted without deleting anything.
     dryRun: optional("WALLET_PRUNE_DRY_RUN", "false") === "true",
     threshold: num("WALLET_PRUNE_THRESHOLD", 350),
-    // How many of the oldest wallets to consider per sweep. Only the empty ones
-    // inside this window are deleted, so a sweep frees between 0 and `window`.
-    window: num("WALLET_PRUNE_WINDOW", 200),
+    // Ceiling on how many wallets one sweep may destroy, so a miscount can
+    // never take out the whole account in a single pass.
+    maxPerRun: num("WALLET_PRUNE_MAX_PER_RUN", 200),
     intervalHours: num("WALLET_PRUNE_INTERVAL_HOURS", 6),
-    // Never delete a wallet younger than this — a user may still be about to
-    // pay into an address /topup handed them.
-    minAgeHours: num("WALLET_PRUNE_MIN_AGE_HOURS", 24),
   };
 }
 
@@ -174,8 +172,8 @@ interface WalletListEntry {
   type?: string;
   network?: string;
   status?: string;
-  /** Token ticker -> { available }. Only the list endpoint returns balances. */
-  balances?: Record<string, { available?: number | string | null } | null> | null;
+  // The list endpoint also returns a `balances` map. The prune deliberately
+  // ignores it — see pruneOldWallets().
 }
 
 interface WalletListData {
@@ -285,15 +283,6 @@ async function listWalletPage(offset: number, limit: number): Promise<WalletList
   return data ?? {};
 }
 
-/** GET /wallets?address= — re-reads a single wallet, for the pre-delete check. */
-async function fetchWallet(address: string): Promise<WalletListEntry | undefined> {
-  const data = await walletApiRequest<WalletListData>(
-    "GET",
-    `/wallets?address=${encodeURIComponent(address)}`,
-  );
-  return data?.wallets?.find((w) => w.address === address);
-}
-
 /** DELETE /wallets — the address goes in the JSON body, not the path. */
 async function deleteWallet(address: string): Promise<void> {
   await walletApiRequest<{ result?: string }>("DELETE", "/wallets", { address });
@@ -335,45 +324,20 @@ function createdAtFromName(name?: string): number | null {
   return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
 
-/**
- * Balance state of a wallet, as three states rather than a boolean.
- *
- * Missing or unparseable balance data must NOT read as "empty": deleting is
- * irreversible, so absent evidence of funds is not evidence of absence. Only an
- * explicit zero on every token authorises deletion; anything else is "unknown"
- * and the wallet is left alone.
- */
-function fundsState(wallet: WalletListEntry): "empty" | "funded" | "unknown" {
-  const balances = wallet.balances;
-  if (!balances || typeof balances !== "object") return "unknown";
-  const entries = Object.values(balances);
-  if (entries.length === 0) return "unknown";
-
-  for (const balance of entries) {
-    const raw = balance?.available;
-    // Number(null) and Number("") are both 0, so converting first would read
-    // "no data" as a confirmed zero balance and authorise deleting the wallet.
-    // Reject anything that isn't an actual figure before converting.
-    if (raw === null || raw === undefined) return "unknown";
-    if (typeof raw === "string" && raw.trim() === "") return "unknown";
-    const available = Number(raw);
-    if (!Number.isFinite(available) || available < 0) return "unknown";
-    if (available > 0) return "funded";
-  }
-  return "empty"; // every token reported an explicit zero
-}
-
 let isPruning = false;
 
 /**
- * Frees headroom under the provider's 500-wallet cap. Once the account exceeds
- * WALLET_PRUNE_THRESHOLD, this looks at the oldest WALLET_PRUNE_WINDOW wallets
- * and deletes only the ones holding a zero balance.
+ * Frees headroom under the provider's 500-wallet cap: once the account exceeds
+ * WALLET_PRUNE_THRESHOLD, the oldest wallets are deleted back down to it, at
+ * most WALLET_PRUNE_MAX_PER_RUN per sweep.
  *
- * Deletion is irreversible — the provider warns that funds sent to a deleted
- * address are inaccessible without their support team. So a wallet is only ever
- * a candidate when all three hold: this bot created it (name pattern), every
- * token balance is zero, and it is older than WALLET_PRUNE_MIN_AGE_HOURS.
+ * Balance and age are deliberately NOT consulted. A wallet still holding USDT
+ * is deleted along with the rest, and the provider warns those funds are then
+ * only recoverable by contacting their support team.
+ *
+ * The one filter left is the `tg-<userId>-<epochMs>` name, and it is not a
+ * safeguard: the API returns no creation timestamp, so a wallet named any other
+ * way has no recoverable age to sort by and cannot be placed in the ordering.
  */
 async function pruneOldWallets(trigger: string): Promise<void> {
   const cfg = config.prune;
@@ -401,66 +365,27 @@ async function pruneOldWallets(trigger: string): Promise<void> {
     }
     aged.sort((a, b) => a.createdAt - b.createdAt); // oldest first
 
-    // Look at the oldest `window` wallets and take only the empty ones.
-    const cutoff = Date.now() - cfg.minAgeHours * 60 * 60 * 1000;
-    const oldest = aged.slice(0, cfg.window);
-    const doomed: Array<{ entry: WalletListEntry; createdAt: number }> = [];
-    let funded = 0;
-    let tooNew = 0;
-    let unknown = 0;
-    for (const candidate of oldest) {
-      const state = fundsState(candidate.entry);
-      if (state === "funded") funded++;
-      else if (state === "unknown") unknown++;
-      else if (candidate.createdAt > cutoff) tooNew++;
-      else doomed.push(candidate);
-    }
+    // Delete only as many as it takes to get back to the threshold — deleting a
+    // whole batch to reclaim one slot would destroy addresses for nothing.
+    const needed = total - cfg.threshold;
+    const doomed = aged.slice(0, Math.min(needed, cfg.maxPerRun));
 
     logger.info(
-      `Wallet prune (${trigger}): ${total} wallets exceeds ${cfg.threshold} — scanning the oldest ` +
-        `${oldest.length} of ${aged.length} bot-created, deleting ${doomed.length} with a zero balance ` +
-        `(kept back: ${funded} funded, ${unknown} balance unknown, ${tooNew} younger than ` +
-        `${cfg.minAgeHours}h, ${foreign} not bot-created).`,
+      `Wallet prune (${trigger}): ${total} wallets exceeds ${cfg.threshold} — deleting the ` +
+        `${doomed.length} oldest of ${aged.length} bot-created, balances not checked ` +
+        `(${foreign} not bot-created, left alone).`,
     );
-    if (unknown > 0) {
+    if (needed > cfg.maxPerRun) {
       logger.warn(
-        `Wallet prune: ${unknown} wallets report no usable balance figure and were left alone. If this ` +
-          `is every wallet, the list endpoint is not returning balances — do not disable this guard.`,
-      );
-    }
-    if (total - doomed.length > cfg.threshold) {
-      logger.warn(
-        `Wallet prune: ${total - doomed.length} wallets would remain, still above ${cfg.threshold} — ` +
-          `raise WALLET_PRUNE_WINDOW or sweep funded wallets to free more.`,
+        `Wallet prune: capped at ${cfg.maxPerRun} this sweep; ${needed - cfg.maxPerRun} more to go next time.`,
       );
     }
 
     let deleted = 0;
-    let raced = 0;
     for (const { entry, createdAt } of doomed) {
       const age = `${Math.round((Date.now() - createdAt) / (60 * 60 * 1000))}h old`;
       if (cfg.dryRun) {
         logger.info(`Wallet prune [dry run]: would delete ${entry.address} (${entry.name}, ${age})`);
-        continue;
-      }
-
-      // Re-read the balance immediately before deleting. The listing above can
-      // be a minute old by the time we reach the tail of the queue, and a
-      // deposit landing in that gap would otherwise be deleted with the wallet.
-      let state: ReturnType<typeof fundsState>;
-      try {
-        const fresh = await fetchWallet(entry.address);
-        state = fresh ? fundsState(fresh) : "unknown";
-      } catch (err) {
-        logger.error(`Wallet prune: balance re-check failed for ${entry.address}, skipping:`, err);
-        raced++;
-        continue;
-      }
-      if (state !== "empty") {
-        logger.warn(
-          `Wallet prune: skipping ${entry.address} — balance became ${state} since the listing.`,
-        );
-        raced++;
         continue;
       }
 
@@ -472,9 +397,6 @@ async function pruneOldWallets(trigger: string): Promise<void> {
         logger.error(`Wallet prune: failed to delete ${entry.address}:`, err);
       }
       await sleep(PRUNE_DELETE_DELAY_MS);
-    }
-    if (raced > 0) {
-      logger.warn(`Wallet prune: ${raced} wallets skipped at delete time by the balance re-check.`);
     }
     if (!cfg.dryRun) {
       logger.info(`Wallet prune (${trigger}): deleted ${deleted}, ${total - deleted} wallets remain.`);
@@ -493,10 +415,10 @@ function startWalletPruneSchedule(): void {
     logger.warn("Wallet pruning disabled (set WALLET_PRUNE_ENABLED=true to enable).");
     return;
   }
-  logger.info(
-    `Wallet pruning enabled: above ${cfg.threshold} wallets, delete empty ones among the oldest ` +
-      `${cfg.window}; every ${cfg.intervalHours}h, min age ${cfg.minAgeHours}h` +
-      `${cfg.dryRun ? " [DRY RUN — nothing will be deleted]" : ""}.`,
+  logger.warn(
+    `Wallet pruning enabled: above ${cfg.threshold} wallets, delete the oldest back down to it ` +
+      `(max ${cfg.maxPerRun} per sweep) every ${cfg.intervalHours}h. Balances are NOT checked — ` +
+      `wallets holding funds will be deleted.${cfg.dryRun ? " [DRY RUN — nothing will be deleted]" : ""}`,
   );
   void pruneOldWallets("startup");
   setInterval(() => void pruneOldWallets("scheduled"), cfg.intervalHours * 60 * 60 * 1000);
